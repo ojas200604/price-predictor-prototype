@@ -1,0 +1,1 @@
+"Train model using the provided real market arrivals CSV.\n\nThis script loads the CSV in data/, cleans columns, trains a simple RandomForestRegressor,\nand saves the model to models/model_real.pkl and metrics to models/metrics.json.\n\nRequirements: pandas, scikit-learn\nUsage: python train_real.py\n","path":"train_real.py"},{
