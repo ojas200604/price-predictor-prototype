@@ -16,9 +16,22 @@ upload = st.sidebar.file_uploader("Or upload your CSV (columns: date,commodity,p
 
 @st.cache_data
 def load_data(use_sample, upload_file):
+    # load either uploaded CSV or the included sample
     if upload_file is not None:
         try:
-            df = pd.read_csv(upload_file)
+            # Try a robust CSV load and basic automatic fix for rows with too many columns
+            raw_text = upload_file.read().decode('utf-8')
+            lines = [ln for ln in raw_text.splitlines() if ln.strip()]
+            cleaned_lines = []
+            for ln in lines:
+                parts = ln.split(',')
+                # keep only first three columns if extra commas accidentally merged rows
+                if len(parts) > 3:
+                    cleaned_lines.append(','.join(parts[:3]))
+                else:
+                    cleaned_lines.append(ln)
+            from io import StringIO
+            df = pd.read_csv(StringIO('\n'.join(cleaned_lines)))
         except Exception as e:
             st.error(f"Failed to read uploaded file: {e}")
             return None
@@ -33,8 +46,12 @@ def load_data(use_sample, upload_file):
         st.error("CSV must contain columns: date, commodity, price")
         return None
 
-    df['date'] = pd.to_datetime(df['date'])
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date'])
     df = df.sort_values('date')
+    # ensure price numeric
+    df['price'] = pd.to_numeric(df['price'], errors='coerce')
+    df = df.dropna(subset=['price'])
     return df
 
 
@@ -55,8 +72,8 @@ def prepare_features(series):
 
 def train_forecast(df_commodity, horizon_days=14):
     df_feat = prepare_features(df_commodity[['date','price']])
-    if len(df_feat) < 30:
-        st.warning("Not enough historical data for a robust model. Need at least ~30 days.")
+    if len(df_feat) < 10:
+        st.warning("Not enough historical data for a robust model. Need at least ~10 days for sensible lag features.")
 
     X = df_feat[['dayofyear','lag_1','lag_7','roll_mean_7']]
     y = df_feat['price']
@@ -64,25 +81,23 @@ def train_forecast(df_commodity, horizon_days=14):
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X, y)
 
-    # iterative forecasting
-    last_known = df_feat.iloc[-1].copy()
+    # iterative forecasting using a simple history buffer
+    history = list(df_feat['price'].values)
+    last_date = df_feat['date'].iloc[-1]
     preds = []
-    current_row = last_known.copy()
+
     for i in range(horizon_days):
-        next_date = current_row['date'] + pd.Timedelta(days=1)
+        next_date = last_date + timedelta(days=i+1)
         next_dayofyear = int(next_date.timetuple().tm_yday)
-        lag_1 = current_row['price'] if i==0 else preds[-1]
-        lag_7 = df_feat['price'].iloc[-7 + i] if len(df_feat) > 7 and i < 7 else (preds[-7] if len(preds) >=7 else current_row['lag_7'])
-        roll_mean_7 = np.mean(list(df_feat['price'].iloc[-6:]) + preds[-(min(len(preds),6)):]) if len(df_feat) >=6 or len(preds)>0 else current_row['roll_mean_7']
+
+        lag_1 = history[-1]
+        lag_7 = history[-7] if len(history) >= 7 else history[-1]
+        roll_mean_7 = np.mean(history[-7:]) if len(history) >= 1 else history[-1]
 
         X_next = np.array([[next_dayofyear, lag_1, lag_7, roll_mean_7]])
         p = model.predict(X_next)[0]
         preds.append(float(p))
-
-        # append to current_row for next iteration
-        current_row = current_row.copy()
-        current_row['date'] = next_date
-        current_row['price'] = p
+        history.append(p)
 
     start_date = df_feat['date'].iloc[-1] + timedelta(days=1)
     pred_dates = pd.date_range(start=start_date, periods=horizon_days, freq='D')
@@ -95,11 +110,39 @@ raw = load_data(use_sample and upload is None, upload)
 if raw is None:
     st.stop()
 
+# Data preview and filters
 st.subheader("Data preview")
-st.write(raw.query("commodity == @commodity").tail(10))
+st.write(raw.head())
 
-# current avg price
-latest = raw.query("commodity == @commodity").sort_values('date').tail(1)
+# Filter by commodity
+df_comm_full = raw.query("commodity == @commodity").sort_values('date')
+if df_comm_full.empty:
+    st.error(f"No data for commodity: {commodity}. Please upload or enable sample data.")
+    st.stop()
+
+# Add a date range selector (timeline) so users can select the training window
+min_date = df_comm_full['date'].min().date()
+max_date = df_comm_full['date'].max().date()
+
+date_range = st.sidebar.date_input("Select historical date range (timeline)", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+
+# Ensure valid range
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_sel, end_sel = date_range
+else:
+    start_sel, end_sel = min_date, max_date
+
+# Subset historical data based on chosen timeline
+df_comm = df_comm_full[(df_comm_full['date'].dt.date >= start_sel) & (df_comm_full['date'].dt.date <= end_sel)].copy()
+
+if df_comm.empty:
+    st.error("No data in the selected date range. Choose a wider range.")
+    st.stop()
+
+st.write(df_comm.tail(10))
+
+# current avg price (from selected dataset)
+latest = df_comm.sort_values('date').tail(1)
 if len(latest):
     last_price = float(latest['price'].iloc[0])
 else:
@@ -114,18 +157,20 @@ with col2:
 
 # Train and forecast
 with st.spinner('Training model and forecasting...'):
-    df_comm = raw.query("commodity == @commodity")[['date','price']].copy()
     if len(df_comm) < 7:
         st.error("Not enough data for forecasting. Need at least 7 days of history.")
         st.stop()
-    model, predictions = train_forecast(df_comm, horizon_days=horizon)
+
+    model, predictions = train_forecast(df_comm[['date','price']].copy(), horizon_days=horizon)
 
 pred_avg = predictions['predicted_price'].mean()
 with col2:
-    st.metric(label=f"{horizon}-Day Predicted Avg Price", value=f"₹{pred_avg:.2f} / qtl", delta=f"{(pred_avg-last_price)/last_price*100:+.1f}%" if last_price else "N/A")
+    st.metric(label=f"{horizon}-Day Predicted Avg Price", value=f"₹{pred_avg:.2f} / qtl", delta=(f"{(pred_avg-last_price)/last_price*100:+.1f}%" if last_price else "N/A"))
 
 st.subheader("Prediction chart")
-plot_df = pd.concat([df_comm.set_index('date')['price'], predictions.set_index('date')['predicted_price']], axis=1)
+plot_hist = df_comm.set_index('date')['price']
+plot_pred = predictions.set_index('date')['predicted_price']
+plot_df = pd.concat([plot_hist, plot_pred], axis=1)
 plot_df.columns = ['historical_price','predicted_price']
 st.line_chart(plot_df)
 
