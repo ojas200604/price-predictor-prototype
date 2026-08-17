@@ -12,7 +12,7 @@ st.sidebar.header("Control Panel")
 commodity = st.sidebar.selectbox("Select Commodity", ["Onion", "Potato", "Tur", "Gram", "Masur"], index=0)
 horizon = st.sidebar.slider("Forecast Horizon (Days)", 7, 30, 14)
 use_sample = st.sidebar.checkbox("Use included sample data (data/prices.csv)", value=True)
-upload = st.sidebar.file_uploader("Or upload your CSV (columns: date,commodity,price)", type=["csv"])
+upload = st.sidebar.file_uploader("Or upload your CSV (columns: date,commodity,price,location)", type=["csv"])
 
 @st.cache_data
 def load_data(use_sample, upload_file):
@@ -25,9 +25,9 @@ def load_data(use_sample, upload_file):
             cleaned_lines = []
             for ln in lines:
                 parts = ln.split(',')
-                # keep only first three columns if extra commas accidentally merged rows
-                if len(parts) > 3:
-                    cleaned_lines.append(','.join(parts[:3]))
+                # keep only first four columns if extra commas accidentally merged rows
+                if len(parts) > 4:
+                    cleaned_lines.append(','.join(parts[:4]))
                 else:
                     cleaned_lines.append(ln)
             from io import StringIO
@@ -43,7 +43,7 @@ def load_data(use_sample, upload_file):
 
     # basic validation
     if 'date' not in df.columns or 'commodity' not in df.columns or 'price' not in df.columns:
-        st.error("CSV must contain columns: date, commodity, price")
+        st.error("CSV must contain columns: date, commodity, price (and optionally location)")
         return None
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -52,11 +52,16 @@ def load_data(use_sample, upload_file):
     # ensure price numeric
     df['price'] = pd.to_numeric(df['price'], errors='coerce')
     df = df.dropna(subset=['price'])
+    
+    # Fill missing locations with "Default" if location column doesn't exist
+    if 'location' not in df.columns:
+        df['location'] = 'Default'
+    
     return df
 
 
 def prepare_features(series):
-    # series: DataFrame with date and price only for chosen commodity
+    # series: DataFrame with date and price only for chosen commodity and location
     s = series.copy().set_index('date')
     s = s.asfreq('D')
     s['price'] = s['price'].interpolate()
@@ -120,6 +125,18 @@ if df_comm_full.empty:
     st.error(f"No data for commodity: {commodity}. Please upload or enable sample data.")
     st.stop()
 
+# Get available locations for the selected commodity
+available_locations = df_comm_full['location'].unique().tolist()
+
+# Location selector in sidebar
+selected_location = st.sidebar.selectbox("Select Location", available_locations, index=0)
+
+# Filter by location
+df_comm_full = df_comm_full.query("location == @selected_location").sort_values('date')
+if df_comm_full.empty:
+    st.error(f"No data for commodity: {commodity} in location: {selected_location}.")
+    st.stop()
+
 # Add a date range selector (timeline) so users can select the training window
 min_date = df_comm_full['date'].min().date()
 max_date = df_comm_full['date'].max().date()
@@ -150,7 +167,7 @@ else:
 
 col1, col2 = st.columns(2)
 with col1:
-    st.metric(label=f"Current Avg Price ({commodity})", value=f"₹{last_price:.2f} / qtl" if last_price is not None else "N/A")
+    st.metric(label=f"Current Avg Price ({commodity} - {selected_location})", value=f"₹{last_price:.2f} / qtl" if last_price is not None else "N/A")
 
 with col2:
     st.write("Forecast")
@@ -178,6 +195,6 @@ st.subheader("Predicted values")
 st.write(predictions)
 
 csv = predictions.to_csv(index=False).encode('utf-8')
-st.download_button("Download predictions as CSV", data=csv, file_name=f"predictions_{commodity}.csv", mime='text/csv')
+st.download_button("Download predictions as CSV", data=csv, file_name=f"predictions_{commodity}_{selected_location}.csv", mime='text/csv')
 
 st.info("Model: RandomForestRegressor trained on lag features. This is a simple prototype — replace with your production model for better accuracy.")
